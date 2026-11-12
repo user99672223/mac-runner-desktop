@@ -79,6 +79,16 @@ jobs:
           hostname: gh-mac
           args: --accept-dns=false
 
+      - name: Restore normal DNS (keep websites working)
+        run: |
+          # tailscale/github-action points macOS DNS at 100.100.100.100 whenever the
+          # tailnet has MagicDNS, but that resolver does not answer on these runners.
+          sudo networksetup -setdnsservers Ethernet Empty
+          sudo networksetup -setsearchdomains Ethernet Empty
+          sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder || true
+          sleep 2
+          curl -fsS -m 15 -o /dev/null https://www.google.com && echo "DNS OK" || { echo "DNS still broken"; scutil --dns | head -20; }
+
       - name: Start RustDesk (direct IP, fixed password) and hold
         run: |
           RD=/Applications/RustDesk.app/Contents/MacOS/RustDesk
