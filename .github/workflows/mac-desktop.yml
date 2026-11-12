@@ -64,18 +64,20 @@ jobs:
           SYS="/Library/Application Support/com.apple.TCC/TCC.db"
           USR="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
           SSD=/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd
+          AG=/System/Library/CoreServices/RemoteManagement/ScreensharingAgent.bundle/Contents/MacOS/ScreensharingAgent
           for db in "$SYS" "$USR"; do
             grant "$db" com.carriez.rustdesk 0
             grant "$db" com.apple.screensharing.agent 0
             grant "$db" "$SSD" 1
+            grant "$db" "$AG" 1
           done
           # Same trick GitHub's image uses for its own agent: pre-approve the
           # monthly "is still recording your screen" prompt.
           PL="$HOME/Library/Group Containers/group.com.apple.replayd/ScreenCaptureApprovals.plist"
-          for c in /Applications/RustDesk.app/Contents/MacOS/RustDesk "$SSD"; do
+          for c in /Applications/RustDesk.app/Contents/MacOS/RustDesk "$SSD" "$AG"; do
             defaults write "$PL" "$c" -date "3024-01-01 00:00:00 +0000"
           done
-          sudo killall tccd 2>/dev/null; killall tccd 2>/dev/null; true
+          # NOTE: do not restart tccd here; doing so mid-job coincided with the job being cancelled
 
       - name: Apple Screen Sharing (VNC fallback)
         run: |
@@ -101,12 +103,13 @@ jobs:
           CFG="$HOME/Library/Preferences/com.carriez.RustDesk"
           mkdir -p "$CFG"
           # Direct IP access on 21118 (reachable only over the tailnet), no relay needed
+          # Plain-text password here is read and encrypted by RustDesk on start
+          # (the --password CLI needs a full admin install on macOS)
+          printf "password = '%s'\n" "$MAC_PASSWORD" > "$CFG/RustDesk.toml"
           printf "[options]\ndirect-server = 'Y'\ndirect-access-port = '21118'\nverification-method = 'use-permanent-password'\napprove-mode = 'password'\n" > "$CFG/RustDesk2.toml"
           # Started from this step so it inherits the runner agent's TCC consent
           nohup "$RD" > /tmp/rustdesk.log 2>&1 &
-          sleep 8
-          "$RD" --password "$MAC_PASSWORD" >> /tmp/rustdesk.log 2>&1 || sudo "$RD" --password "$MAC_PASSWORD" >> /tmp/rustdesk.log 2>&1
-          sleep 3
+          sleep 10
           echo "--- listening ports"; sudo lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(21118|5900|22) ' || true
           echo "Tailscale IP: $(tailscale ip -4 | head -1)"
           end=$(( $(date +%s) + $(python3 -c "print(int(float('${{ inputs.hours }}')*3600))") ))
