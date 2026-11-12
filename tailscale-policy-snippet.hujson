@@ -1,0 +1,18 @@
+// Merge into your tailnet policy file (admin console → Access controls).
+// IMPORTANT: if your policy still has the default allow-all rule, a runner
+// tagged tag:gh-mac could reach every device on your tailnet. These rules let
+// only admins reach the runner, and the runner reach nothing.
+{
+  "tagOwners": {
+    "tag:gh-mac": ["autogroup:admin"],
+  },
+  "grants": [
+    {
+      "src": ["autogroup:admin"],
+      "dst": ["tag:gh-mac"],
+      // 5900 = Apple Screen Sharing/VNC, 22 = SSH,
+      // 21118 = RustDesk direct-IP (for the later RustDesk phase)
+      "ip": ["tcp:5900", "tcp:22", "tcp:21118"],
+    },
+  ],
+}

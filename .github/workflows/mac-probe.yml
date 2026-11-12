@@ -1,0 +1,100 @@
+# Probe run: measures what a GitHub-hosted macOS runner really offers
+# (CPU/RAM/GPU, SIP, display, hardware video encoder, whether Screen Sharing
+# shows a real picture) and keeps it reachable over Tailscale for a while.
+name: mac-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label
+        default: macos-15
+        type: choice
+        options: [macos-15, macos-26, macos-15-intel, macos-26-intel]
+      hold_minutes:
+        description: Minutes to keep the Mac reachable after probing (0 = none)
+        default: "30"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Hardware, GPU, SIP and console facts
+        run: |
+          set -x
+          sw_vers; uname -m
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          csrutil status || true
+          system_profiler SPHardwareDataType SPDisplaysDataType
+          echo "console owner: $(stat -f %Su /dev/console)"
+          who
+
+      - name: Hardware video encoder (VideoToolbox) check
+        continue-on-error: true
+        run: |
+          brew install --quiet ffmpeg
+          # -allow_sw 0 makes this fail if no hardware encoder exists
+          for enc in h264_videotoolbox hevc_videotoolbox; do
+            if ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=1920x1080:rate=60 \
+                 -t 5 -c:v "$enc" -allow_sw 0 -b:v 20M -f null - ; then
+              echo "RESULT $enc: hardware encode OK"
+            else
+              echo "RESULT $enc: NOT available"
+            fi
+          done
+
+      - name: Screenshot of the real desktop
+        continue-on-error: true
+        run: |
+          mkdir -p probe
+          screencapture -x probe/desktop.png && sips -g pixelWidth -g pixelHeight probe/desktop.png
+
+      - name: Join tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:gh-mac
+          hostname: gh-mac-probe
+
+      - name: Enable Screen Sharing and try to grant it screen capture
+        continue-on-error: true
+        env:
+          MAC_PASSWORD: ${{ secrets.MAC_PASSWORD }}
+        run: |
+          # Password for the "runner" user = Apple (ARD) auth login for Remmina
+          sudo dscl . -passwd /Users/runner "$MAC_PASSWORD"
+          KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          sudo "$KS" -activate -configure -access -on -users runner -privs -all -restart -agent -menu
+          sudo "$KS" -configure -allowAccessFor -specifiedUsers
+          # Apple says kickstart can't enable Screen Sharing on 12.1+ without
+          # screen-capture consent, so try writing the TCC rows directly.
+          TCC="/Library/Application Support/com.apple.TCC/TCC.db"
+          for svc in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent; do
+            sudo sqlite3 "$TCC" "INSERT OR REPLACE INTO access
+              (service, client, client_type, auth_value, auth_reason, auth_version, flags)
+              VALUES ('$svc','com.apple.screensharing.agent',0,2,4,1,0);" \
+              && echo "TCC grant $svc: written" || echo "TCC grant $svc: FAILED"
+          done
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || echo "port 5900 NOT listening"
+          echo "Connect from Debian: remmina -c vnc://runner@$(tailscale ip -4 | head -1):5900"
+
+      - name: Upload probe output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ inputs.runner }}
+          path: probe/
+          if-no-files-found: ignore
+
+      - name: Hold for interactive testing (touch /tmp/stop to end early)
+        if: inputs.hold_minutes != '0'
+        run: |
+          end=$(( $(date +%s) + ${{ inputs.hold_minutes }} * 60 ))
+          echo "Tailscale IP: $(tailscale ip -4 | head -1)"
+          while [ "$(date +%s)" -lt "$end" ] && [ ! -f /tmp/stop ]; do sleep 30; done
