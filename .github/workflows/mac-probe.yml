@@ -53,36 +53,14 @@ jobs:
           mkdir -p probe
           screencapture -x probe/desktop.png && sips -g pixelWidth -g pixelHeight probe/desktop.png
 
-      - name: Join tailnet
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:gh-mac
-          hostname: gh-mac-probe
-
-      - name: Enable Screen Sharing and try to grant it screen capture
+      - name: Display modes and try 1920x1080
         continue-on-error: true
-        env:
-          MAC_PASSWORD: ${{ secrets.MAC_PASSWORD }}
         run: |
-          # Password for the "runner" user = Apple (ARD) auth login for Remmina
-          sudo dscl . -passwd /Users/runner "$MAC_PASSWORD"
-          KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          sudo "$KS" -activate -configure -access -on -users runner -privs -all -restart -agent -menu
-          sudo "$KS" -configure -allowAccessFor -specifiedUsers
-          # Apple says kickstart can't enable Screen Sharing on 12.1+ without
-          # screen-capture consent, so try writing the TCC rows directly.
-          TCC="/Library/Application Support/com.apple.TCC/TCC.db"
-          for svc in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent; do
-            sudo sqlite3 "$TCC" "INSERT OR REPLACE INTO access
-              (service, client, client_type, auth_value, auth_reason, auth_version, flags)
-              VALUES ('$svc','com.apple.screensharing.agent',0,2,4,1,0);" \
-              && echo "TCC grant $svc: written" || echo "TCC grant $svc: FAILED"
-          done
-          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
-          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || echo "port 5900 NOT listening"
-          echo "Connect from Debian: remmina -c vnc://runner@$(tailscale ip -4 | head -1):5900"
+          brew install --quiet displayplacer || brew install --quiet jakehilborn/jakehilborn/displayplacer
+          displayplacer list | tee probe/displays.txt | grep -E 'Persistent screen id|Resolution|mode .*current' || true
+          id=$(displayplacer list | awk '/Persistent screen id/{print $4; exit}')
+          displayplacer "id:$id res:1920x1080 scaling:off" || echo "RESULT 1920x1080: not settable"
+          sleep 2; screencapture -x probe/desktop-after.png && sips -g pixelWidth -g pixelHeight probe/desktop-after.png
 
       - name: Upload probe output
         if: always()
@@ -91,6 +69,46 @@ jobs:
           name: probe-${{ inputs.runner }}
           path: probe/
           if-no-files-found: ignore
+
+      - name: Join tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:gh-mac
+          hostname: gh-mac-probe
+          # macOS runner lost DNS after joining with MagicDNS on
+          args: --accept-dns=false
+
+      - name: Enable Screen Sharing and try to grant it screen capture
+        continue-on-error: true
+        env:
+          MAC_PASSWORD: ${{ secrets.MAC_PASSWORD }}
+        run: |
+          set +e
+          # Changing runner's password fails (eDSAuthFailed), so add our own admin
+          sudo sysadminctl -addUser dev -fullName dev -password "$MAC_PASSWORD" -admin
+          id dev
+          KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          sudo "$KS" -activate -configure -access -on -users dev,runner -privs -all -restart -agent -menu
+          sudo "$KS" -configure -allowAccessFor -specifiedUsers
+          # Legacy VNC password (VNC only uses the first 8 characters)
+          sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "${MAC_PASSWORD:0:8}"
+          # Apple says kickstart can't enable Screen Sharing on 12.1+ without
+          # screen-capture consent; SIP is off on runners, so write TCC rows.
+          TCC="/Library/Application Support/com.apple.TCC/TCC.db"
+          for svc in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent; do
+            sudo sqlite3 "$TCC" "INSERT OR REPLACE INTO access
+              (service, client, client_type, auth_value, auth_reason, auth_version, flags)
+              VALUES ('$svc','com.apple.screensharing.agent',0,2,4,1,0);" \
+              && echo "TCC grant $svc: written" || echo "TCC grant $svc: FAILED"
+          done
+          sudo sqlite3 "$TCC" "SELECT service, client, auth_value FROM access WHERE client LIKE '%screensharing%';"
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null
+          sleep 3
+          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || echo "port 5900 NOT listening"
+          curl -sS -o /dev/null -w 'DNS still works: HTTP %{http_code}\n' https://api.github.com || echo "DNS BROKEN"
+          echo "Tailscale IP: $(tailscale ip -4 | head -1)"
 
       - name: Hold for interactive testing (touch /tmp/stop to end early)
         if: inputs.hold_minutes != '0'
