@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Control a GitHub-hosted Mac from this laptop.
+#   mac start [hours]   start a session (default 2h, max 5.8h) and connect
+#   mac connect         (re)open RustDesk to the running Mac
+#   mac status          show session state and Tailscale address
+#   mac ssh             terminal on the Mac as "dev" (password: .mac-password)
+#   mac stop            end the session (anything not pushed/copied off is lost)
+set -euo pipefail
+
+REPO=user99672223/mac-runner-desktop
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+PWFILE="$DIR/.mac-password"
+# This laptop's gh login lives here even when HOME differs
+[ -d /home/familybadgujarwilly/.config/gh ] && export GH_CONFIG_DIR=/home/familybadgujarwilly/.config/gh
+
+run_id() {
+  gh run list -R "$REPO" --workflow mac-desktop --status in_progress --limit 1 \
+    --json databaseId --jq '.[0].databaseId // empty'
+}
+mac_ip() { tailscale status | awk '$2=="gh-mac" && !/offline/ {print $1; exit}'; }
+
+connect() {
+  local ip; ip=$(mac_ip)
+  [ -z "$ip" ] && { echo "No Mac online. Run: mac start"; exit 1; }
+  echo "Opening RustDesk to $ip:21118"
+  nohup rustdesk --connect "$ip:21118" --password "$(cat "$PWFILE")" >/dev/null 2>&1 &
+}
+
+case "${1:-}" in
+  start)
+    hours="${2:-2}"
+    if [ -n "$(run_id)" ]; then echo "A session is already running."; connect; exit 0; fi
+    gh workflow run mac-desktop -R "$REPO" -f runner=macos-15 -f hours="$hours" >/dev/null
+    echo "Starting a Mac for ${hours}h (usually 2-4 minutes)..."
+    sleep 8
+    for _ in $(seq 1 60); do
+      step=$(gh run view "$(run_id)" -R "$REPO" --json jobs \
+        --jq '.jobs[0].steps // [] | map(select(.status=="in_progress")) | .[0].name // "queued"' 2>/dev/null || echo queued)
+      printf '\r  %-70s' "$step"
+      if [[ "$step" == *hold* ]] && [ -n "$(mac_ip)" ]; then echo; sleep 15; connect; exit 0; fi
+      sleep 10
+    done
+    echo; echo "Timed out waiting. Check: mac status"; exit 1 ;;
+  connect) connect ;;
+  status)
+    id=$(run_id)
+    if [ -n "$id" ]; then echo "Session running: https://github.com/$REPO/actions/runs/$id"; else echo "No session running."; fi
+    ip=$(mac_ip); [ -n "$ip" ] && echo "Mac on tailnet: $ip (RustDesk $ip:21118, ssh dev@$ip)" ;;
+  ssh)
+    ip=$(mac_ip); [ -z "$ip" ] && { echo "No Mac online."; exit 1; }
+    echo "Password is in $PWFILE"
+    exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "dev@$ip" ;;
+  stop)
+    id=$(run_id); [ -z "$id" ] && { echo "No session running."; exit 0; }
+    gh run cancel "$id" -R "$REPO" && pkill -x rustdesk || true
+    echo "Session stopped." ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

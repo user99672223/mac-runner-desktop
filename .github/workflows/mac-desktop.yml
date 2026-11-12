@@ -1,6 +1,10 @@
-# Interactive macOS desktop over Tailscale.
-# Primary: RustDesk started from this job (inherits the runner agent's
-# screen-capture/accessibility consent). Fallback: Apple Screen Sharing (VNC).
+# Interactive macOS desktop over Tailscale, via RustDesk (direct IP, port 21118).
+# RustDesk is started from the job step, so it inherits the runner agent's
+# screen-capture/accessibility consent and sees runner's desktop even though
+# that session sits behind a lock screen from boot.
+# Apple Screen Sharing is deliberately NOT used: it only shows black or the
+# lock screen, and logging in another user over it switches the console away
+# from runner's session (which breaks RustDesk until the runner is recycled).
 name: mac-desktop
 
 on:
@@ -32,7 +36,7 @@ jobs:
           id=$(displayplacer list | awk '/Persistent screen id/{print $4; exit}')
           displayplacer "id:$id res:1920x1080 scaling:off" || true
 
-      - name: Admin user "dev" and SSH
+      - name: Admin user "dev" for SSH (never log in as dev on the screen)
         run: |
           set +e
           sudo sysadminctl -addUser dev -fullName dev -password "$MAC_PASSWORD" -admin
@@ -51,42 +55,20 @@ jobs:
           hdiutil detach -quiet /tmp/rdmnt
           echo "RustDesk $ver installed"
 
-      - name: Grant screen capture/input to RustDesk and Screen Sharing
+      - name: Grant screen capture/input to RustDesk
         run: |
           set +e
-          grant() { # db client client_type
+          for db in "/Library/Application Support/com.apple.TCC/TCC.db" "$HOME/Library/Application Support/com.apple.TCC/TCC.db"; do
             for svc in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent; do
-              sudo sqlite3 "$1" "INSERT OR REPLACE INTO access
+              sudo sqlite3 "$db" "INSERT OR REPLACE INTO access
                 (service, client, client_type, auth_value, auth_reason, auth_version, flags)
-                VALUES ('$svc','$2',$3,2,4,1,0);" || echo "grant $svc $2 FAILED in $1"
+                VALUES ('$svc','com.carriez.rustdesk',0,2,4,1,0);" || echo "grant $svc FAILED in $db"
             done
-          }
-          SYS="/Library/Application Support/com.apple.TCC/TCC.db"
-          USR="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-          SSD=/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd
-          AG=/System/Library/CoreServices/RemoteManagement/ScreensharingAgent.bundle/Contents/MacOS/ScreensharingAgent
-          for db in "$SYS" "$USR"; do
-            grant "$db" com.carriez.rustdesk 0
-            grant "$db" com.apple.screensharing.agent 0
-            grant "$db" "$SSD" 1
-            grant "$db" "$AG" 1
           done
-          # Same trick GitHub's image uses for its own agent: pre-approve the
-          # monthly "is still recording your screen" prompt.
-          PL="$HOME/Library/Group Containers/group.com.apple.replayd/ScreenCaptureApprovals.plist"
-          for c in /Applications/RustDesk.app/Contents/MacOS/RustDesk "$SSD" "$AG"; do
-            defaults write "$PL" "$c" -date "3024-01-01 00:00:00 +0000"
-          done
-          # NOTE: do not restart tccd here; doing so mid-job coincided with the job being cancelled
-
-      - name: Apple Screen Sharing (VNC fallback)
-        run: |
-          set +e
-          KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          sudo "$KS" -activate -configure -access -on -users dev,runner -privs -all -restart -agent -menu
-          sudo "$KS" -configure -allowAccessFor -specifiedUsers
-          sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "${MAC_PASSWORD:0:8}"
-          sudo launchctl kickstart -k system/com.apple.screensharing
+          # Pre-approve the periodic "is still recording your screen" prompt
+          defaults write "$HOME/Library/Group Containers/group.com.apple.replayd/ScreenCaptureApprovals.plist" \
+            /Applications/RustDesk.app/Contents/MacOS/RustDesk -date "3024-01-01 00:00:00 +0000"
+          # Do not restart tccd: doing so mid-job coincided with the job being cancelled
 
       - name: Join tailnet
         uses: tailscale/github-action@v4
@@ -110,7 +92,7 @@ jobs:
           # Started from this step so it inherits the runner agent's TCC consent
           nohup "$RD" > /tmp/rustdesk.log 2>&1 &
           sleep 10
-          echo "--- listening ports"; sudo lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(21118|5900|22) ' || true
+          echo "--- listening ports"; sudo lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(21118|22) ' || true
           echo "Tailscale IP: $(tailscale ip -4 | head -1)"
           end=$(( $(date +%s) + $(python3 -c "print(int(float('${{ inputs.hours }}')*3600))") ))
           while [ "$(date +%s)" -lt "$end" ] && [ ! -f /tmp/stop ]; do sleep 30; done
