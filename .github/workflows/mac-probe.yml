@@ -54,7 +54,7 @@ jobs:
           screencapture -x probe/desktop.png && sips -g pixelWidth -g pixelHeight probe/desktop.png
 
       - name: Join tailnet
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
